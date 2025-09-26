@@ -1,282 +1,324 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>CPU‑Only Path Tracer Benchmark – Heavy Load</title>
-<style>
-  body{font-family:monospace;margin:2rem;background:#222;color:#eee;}
-  #canvas{border:1px solid #555;background:#111;}
-  #controls{margin-top:1rem;}
-  button{padding:.5rem 1rem;font-size:1rem;margin-right:.5rem;}
-  #results{margin-top:1rem;white-space:pre-wrap;}
-  #progress{margin-top:.5rem;background:#444;height:10px;overflow:hidden;}
-  #progress>div{background:#0c0;height:100%;width:0;}
-</style>
+  <meta charset="utf-8">
+  <title>CPU‑Only Path Tracer Benchmark – Heavy Load</title>
+  <style>
+    body{font-family:monospace;margin:2rem;background:#222;color:#eee;}
+    #canvas{border:1px solid #555;background:#111;}
+    #controls{margin-top:1rem;}
+    button{padding:.5rem 1rem;font-size:1rem;margin-right:.5rem;}
+    #results{margin-top:1rem;white-space:pre-wrap;}
+    #progress{margin-top:.5rem;background:#444;height:10px;overflow:hidden;}
+    #progress>div{background:#0c0;height:100%;width:0;}
+  </style>
 </head>
 <body>
-<h1>CPU‑Only Path Tracer Benchmark – Heavy Load</h1>
-<canvas id="canvas" width="1200" height="1200"></canvas>
-<div id="controls">
-  <button id="start">Start Benchmark</button>
-  <button id="stop" disabled>Stop (while rendering)</button>
-</div>
-<div id="results"></div>
-<div id="progress"><div></div></div>
-<script>
-/* ------------------------------------------------------------ */
-/* -----------------  Simple Vector3 helper  ----------------- */
-class Vec3{
-  constructor(x,y,z){this.x=x;this.y=y;this.z=z;}
-  add(v){return new Vec3(this.x+v.x,this.y+v.y,this.z+v.z);}
-  sub(v){return new Vec3(this.x-v.x,this.y-v.y,this.z-v.z);}
-  mul(t){return new Vec3(this.x*t,this.y*t,this.z*t);}
-  div(t){return this.mul(1/t);}
-  mulV(v){return new Vec3(this.x*v.x,this.y*v.y,this.z*v.z);}
-  dot(v){return this.x*v.x+this.y*v.y+this.z*v.z;}
-  cross(v){
-    return new Vec3(
-      this.y*v.z-this.z*v.y,
-      this.z*v.x-this.x*v.z,
-      this.x*v.y-this.y*v.x
-    );
-  }
-  length(){return Math.sqrt(this.dot(this));}
-  unit(){return this.div(this.length());}
-}
-function rand(){return Math.random();}
-function randInUnitSphere(){
-  while(true){
-    const p = new Vec3(rand()*2-1, rand()*2-1, rand()*2-1);
-    if(p.dot(p)<1) return p;
-  }
-}
-function clamp(x){return x<0?0:x>1?1:x;}
-function to255(x){return Math.floor(255*clamp(x));}
-function writeColor(ctx, x, y, pixelColor, samplesPerPixel){
-  const r = Math.sqrt(pixelColor.x / samplesPerPixel);
-  const g = Math.sqrt(pixelColor.y / samplesPerPixel);
-  const b = Math.sqrt(pixelColor.z / samplesPerPixel);
-  ctx.fillStyle = `rgb(${to255(r)},${to255(g)},${to255(b)})`;
-  ctx.fillRect(x, y, 1, 1);
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Ray & Hit  ---------------------------- */
-class Ray{
-  constructor(origin, dir){this.o=origin;this.d=dir.unit();}
-  at(t){return this.o.add(this.d.mul(t));}
-}
-class HitRecord{
-  constructor(){this.p=null;this.n=null;this.t=0;this.frontFace=true;this.mat=null;}
-  setFaceNormal(r, outwardNormal){
-    this.frontFace = r.d.dot(outwardNormal) < 0;
-    this.n = this.frontFace ? outwardNormal : outwardNormal.mul(-1);
-  }
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Materials  ---------------------------- */
-class Material{
-  constructor(albedo, roughness){this.albedo=albedo;this.roughness=roughness;}
-  scatter(rayIn, rec, attenuation, scattered){
-    // diffuse Lambertian
-    const scatterDir = rec.n.add(randInUnitSphere()).unit();
-    scattered[0] = new Ray(rec.p, scatterDir);
-    attenuation[0] = this.albedo;
-    return true;
-  }
-}
-class EmissiveMaterial{
-  constructor(albedo){this.albedo=albedo;}
-  scatter(){return false;}
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Sphere  --------------------------------- */
-class Sphere{
-  constructor(center, radius, mat){
-    this.center=center;
-    this.radius=radius;
-    this.mat=mat;
-  }
-  hit(ray, tMin, tMax, rec){
-    const oc = ray.o.sub(this.center);
-    const a = ray.d.dot(ray.d);
-    const halfB = oc.dot(ray.d);
-    const c = oc.dot(oc) - this.radius*this.radius;
-    const discriminant = halfB*halfB - a*c;
-    if(discriminant < 0) return false;
-    const sqrtd = Math.sqrt(discriminant);
-    let root = (-halfB - sqrtd)/a;
-    if(root < tMin || root > tMax){
-      root = (-halfB + sqrtd)/a;
-      if(root < tMin || root > tMax) return false;
-    }
-    rec.t = root;
-    rec.p = ray.at(rec.t);
-    const outwardNormal = rec.p.sub(this.center).div(this.radius);
-    rec.setFaceNormal(ray, outwardNormal);
-    rec.mat = this.mat;
-    return true;
-  }
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Scene – many balls  ------------------- */
-const spheres = [];
-
-// Ground plane – big flat sphere below everything
-spheres.push(new Sphere(new Vec3(0,-1000,0), 1000, new Material(new Vec3(0.8,0.8,0.0),0.0)));
-
-// 1. Basic 20–25 spheres (the old “balls” you had)
-for(let i=0;i<30;i++){
-  const center = new Vec3(rand()*4-2, rand()*4-2, rand()*4-2);
-  const radius = rand()*0.5+0.2;
-  const albedo = new Vec3(rand(), rand(), rand());
-  spheres.push(new Sphere(center, radius, new Material(albedo,0.0)));
-}
-
-// 2. Add 40–60 *random* spheres
-const extra = 50; // change this to 30, 80, … to adjust difficulty
-for(let i=0;i<extra;i++){
-  // Random radius – make them a bit bigger so intersections happen
-  const radius = rand()*1.5 + 0.3;
-  const center = new Vec3(
-      (rand()-0.5)*8,          // x in [-4,4]
-      (rand()-0.5)*8 + 1.5,    // y in [0,8] – push upward to avoid falling on ground
-      (rand()-0.5)*8           // z in [-4,4]
-  );
-  const albedo = new Vec3(rand(), rand(), rand());
-  const roughness = rand()*0.3;          // keep it mostly Lambertian
-  spheres.push(new Sphere(center, radius, new Material(albedo, roughness)));
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  World  -------------------------------- */
-function hitWorld(ray, tMin, tMax, rec){
-  let tempRec = new HitRecord();
-  let hitAnything = false;
-  let closestSoFar = tMax;
-  for(const s of spheres){
-    if(s.hit(ray, tMin, closestSoFar, tempRec)){
-      hitAnything = true;
-      closestSoFar = tempRec.t;
-      rec.p = tempRec.p;
-      rec.n = tempRec.n;
-      rec.t = tempRec.t;
-      rec.mat = tempRec.mat;
-      rec.frontFace = tempRec.frontFace;
-    }
-  }
-  return hitAnything;
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Materials  -------------------------------- */
-class Lambertian extends Material{
-  constructor(albedo){super(albedo,0.0);}
-}
-class Diffuse extends Material{
-  constructor(albedo, roughness){super(albedo,roughness);}
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Render‑Core  --------------------------- */
-const canvas=document.getElementById('canvas');
-const ctx=canvas.getContext('2d');
-const imageWidth=canvas.width, imageHeight=canvas.height;
-const samplesPerPixel=200;        // ← increase the pixel‑work
-const maxDepth=8;                 // ← higher recursion depth
-
-// Progress bar
-const progBar=document.querySelector('#progress>div');
-function setProgress(percent){
-  progBar.style.width = percent+'%';
-}
-
-let cancelRequested=false;
-let rendering=false;
-
-function hitWorldWrapper(ray, rec){
-  return hitWorld(ray, 0.001, Infinity, rec);
-}
-
-function scatterFunc(rayIn, rec, attenuation, scattered){
-  return rec.mat.scatter(rayIn, rec, attenuation, scattered);
-}
-
-/* ------------------------------------------------------------ */
-/* -----------------  Path tracing  -------------------------- */
-function rayColor(ray, depth){
-  if(depth<=0) return new Vec3(0,0,0);
-
-  const rec = new HitRecord();
-  if(hitWorldWrapper(ray, rec)){
-    const scattered = new Array(1);
-    const attenuation = new Array(1);
-    if(scatterFunc(ray, rec, attenuation, scattered)){
-      return attenuation[0].mulV(rayColor(scattered[0], depth-1));
-    }
-    return new Vec3(0,0,0);
-  }
-  // simple sky gradient
-  const unitDir = ray.d.unit();
-  const t = 0.5*(unitDir.y+1.0);
-  return new Vec3(1,1,1).mul(1-t).add(new Vec3(0.5,0.7,1.0).mul(t));
-}
-
-async function render(){
-  rendering=true;
-  document.getElementById('start').disabled=true;
-  document.getElementById('stop').disabled=false;
-  cancelRequested=false;
-  const start=timeNow();
-  const totalSamples=imageWidth*imageHeight*samplesPerPixel;
-  let pixelCount=0;
-
-  for(let j=imageHeight-1;j>=0;j--){
-    for(let i=0;i<imageWidth;i++){
-      if(cancelRequested) break;
-      let pixelColor = new Vec3(0,0,0);
-      for(let s=0;s<samplesPerPixel;s++){
-        const u = (i+rand())/imageWidth;
-        const v = (j+rand())/imageHeight;
-        const dir = new Vec3(u-0.5, v-0.5, -1).unit();
-        const r = new Ray(new Vec3(0,0,0), dir);
-        pixelColor = pixelColor.add(rayColor(r, maxDepth));
+  <h1>CPU‑Only Path Tracer Benchmark – Heavy Load</h1>
+  <canvas id="canvas" width="1200" height="1200"></canvas>
+  <div id="controls">
+    <button id="start" type="button">Start Benchmark</button>
+    <button id="stop" type="button" disabled>Stop (while rendering)</button>
+    <label for="previewSpp" style="margin-left:.5rem;">Preview spp:</label>
+    <input id="previewSpp" type="number" min="1" max="32" value="2" style="width:4rem;margin-left:.25rem;" />
+  </div>
+  <div id="results"></div>
+  <div id="progress"><div></div></div>
+  <script>
+  document.addEventListener('DOMContentLoaded', () => {
+    /* ------------------------------------------------------------ */
+    /* -----------------  Simple Vector3 helper  ----------------- */
+    class Vec3 {
+      constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+      add(v) { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+      sub(v) { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+      mul(t) { return new Vec3(this.x * t, this.y * t, this.z * t); }
+      div(t) { return this.mul(1 / t); }
+      mulV(v) { return new Vec3(this.x * v.x, this.y * v.y, this.z * v.z); }
+      dot(v) { return this.x * v.x + this.y * v.y + this.z * v.z; }
+      cross(v) {
+        return new Vec3(
+          this.y * v.z - this.z * v.y,
+          this.z * v.x - this.x * v.z,
+          this.x * v.y - this.y * v.x
+        );
       }
-      writeColor(ctx,i,j,pixelColor,samplesPerPixel);
-      pixelCount++;
+      length() { return Math.sqrt(this.dot(this)); }
+      unit() { return this.div(this.length()); }
     }
-    setProgress(100*pixelCount/(imageWidth*imageHeight));
-    if(cancelRequested) break;
-  }
+    function rand() { return Math.random(); }
+    function randInUnitSphere() {
+      while (true) {
+        const p = new Vec3(rand()*2 - 1, rand()*2 - 1, rand()*2 - 1);
+        if (p.dot(p) < 1) return p;
+      }
+    }
+    function clamp(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+    function to255(x) { return Math.floor(255 * clamp(x)); }
+    function writeColor(ctx, x, y, pixelColor, samplesPerPixel) {
+      // Backwards-compatible fallback (not used in the optimized path)
+      const r = Math.sqrt(pixelColor.x / samplesPerPixel);
+      const g = Math.sqrt(pixelColor.y / samplesPerPixel);
+      const b = Math.sqrt(pixelColor.z / samplesPerPixel);
+      ctx.fillStyle = `rgb(${to255(r)},${to255(g)},${to255(b)})`;
+      ctx.fillRect(x, y, 1, 1);
+    }
 
-  const duration=(timeNow()-start)/1000;
-  document.getElementById('results').textContent =
-    `Rendered ${imageWidth}x${imageHeight} (${samplesPerPixel} spp) in ${duration.toFixed(2)}s\n`+
-    `≈ ${(totalSamples/duration).toFixed(0)} samples per second`;
-  rendering=false;
-  document.getElementById('start').disabled=false;
-  document.getElementById('stop').disabled=true;
-  setProgress(0);
-}
+    /* ------------------------------------------------------------ */
+    /* -----------------  Ray & Hit  ---------------------------- */
+    class Ray {
+      constructor(origin, dir) { this.o = origin; this.d = dir.unit(); }
+      at(t) { return this.o.add(this.d.mul(t)); }
+    }
+    class HitRecord {
+      constructor() {
+        this.p = null; this.n = null; this.t = 0;
+        this.frontFace = true; this.mat = null;
+      }
+      setFaceNormal(r, outwardNormal) {
+        this.frontFace = r.d.dot(outwardNormal) < 0;
+        this.n = this.frontFace ? outwardNormal : outwardNormal.mul(-1);
+      }
+    }
 
-/* ------------------------------------------------------------ */
-/* -----------------  UI  ------------------------------------ */
-document.getElementById('start').addEventListener('click', ()=>{
-  if(rendering) return;
-  ctx.clearRect(0,0,imageWidth,imageHeight);
-  document.getElementById('results').textContent='Running…';
-  render();
-});
-document.getElementById('stop').addEventListener('click', ()=>{
-  cancelRequested=true;
-});
+    /* ------------------------------------------------------------ */
+    /* -----------------  Materials  ---------------------------- */
+    class Material {
+      constructor(albedo, roughness) {
+        this.albedo = albedo;
+        this.roughness = roughness;
+      }
+      scatter(rayIn, rec, attenuation, scattered) {
+        // diffuse Lambertian
+        const scatterDir = rec.n.add(randInUnitSphere()).unit();
+        scattered[0] = new Ray(rec.p, scatterDir);
+        attenuation[0] = this.albedo;
+        return true;
+      }
+    }
+    class EmissiveMaterial {
+      constructor(albedo) { this.albedo = albedo; }
+      scatter() { return false; }
+    }
 
-/* ------------------------------------------------------------ */
-/* ----------------  Helper for timestamps  ------------------- */
-function timeNow(){return performance.now();}
-</script>
+    /* ------------------------------------------------------------ */
+    /* -----------------  Sphere  --------------------------------- */
+    class Sphere {
+      constructor(center, radius, mat) {
+        this.center = center; this.radius = radius; this.mat = mat;
+      }
+      hit(ray, tMin, tMax, rec) {
+        const oc = ray.o.sub(this.center);
+        const a = ray.d.dot(ray.d);
+        const halfB = oc.dot(ray.d);
+        const c = oc.dot(oc) - this.radius * this.radius;
+        const discriminant = halfB*halfB - a*c;
+        if (discriminant < 0) return false;
+        const sqrtd = Math.sqrt(discriminant);
+        let root = (-halfB - sqrtd) / a;
+        if (root < tMin || root > tMax) {
+          root = (-halfB + sqrtd) / a;
+          if (root < tMin || root > tMax) return false;
+        }
+        rec.t = root;
+        rec.p = ray.at(rec.t);
+        const outwardNormal = rec.p.sub(this.center).div(this.radius);
+        rec.setFaceNormal(ray, outwardNormal);
+        rec.mat = this.mat;
+        return true;
+      }
+    }
+
+    /* ------------------------------------------------------------ */
+    /* -----------------  Scene – many balls  ------------------- */
+    const spheres = [];
+    // Ground
+    spheres.push(new Sphere(new Vec3(0, -1000, 0), 1000, new Material(new Vec3(0.8, 0.8, 0.0), 0.0)));
+    for (let i = 0; i < 30; i++) {
+      const center = new Vec3(rand()*4 - 2, rand()*4 - 2, rand()*4 - 2);
+      const radius = rand()*0.5 + 0.2;
+      const albedo = new Vec3(rand(), rand(), rand());
+      spheres.push(new Sphere(center, radius, new Material(albedo, 0.0)));
+    }
+    const extra = 50;
+    for (let i = 0; i < extra; i++) {
+      const radius = rand()*1.5 + 0.3;
+      const center = new Vec3(
+        (rand() - 0.5) * 8,
+        (rand() - 0.5) * 8 + 1.5,
+        (rand() - 0.5) * 8
+      );
+      const albedo = new Vec3(rand(), rand(), rand());
+      const roughness = rand() * 0.3;
+      spheres.push(new Sphere(center, radius, new Material(albedo, roughness)));
+    }
+
+    /* ------------------------------------------------------------ */
+    /* -----------------  World  -------------------------------- */
+    function hitWorld(ray, tMin, tMax, rec) {
+      let tempRec = new HitRecord();
+      let hitAnything = false;
+      let closestSoFar = tMax;
+      for (const s of spheres) {
+        if (s.hit(ray, tMin, closestSoFar, tempRec)) {
+          hitAnything = true;
+          closestSoFar = tempRec.t;
+          rec.p = tempRec.p;
+          rec.n = tempRec.n;
+          rec.t = tempRec.t;
+          rec.mat = tempRec.mat;
+          rec.frontFace = tempRec.frontFace;
+        }
+      }
+      return hitAnything;
+    }
+
+    function hitWorldWrapper(ray, rec) {
+      return hitWorld(ray, 0.001, Infinity, rec);
+    }
+    function scatterFunc(rayIn, rec, attenuation, scattered) {
+      return rec.mat.scatter(rayIn, rec, attenuation, scattered);
+    }
+
+    /* ------------------------------------------------------------ */
+    /* -----------------  Path tracing  -------------------------- */
+    const canvasEl = document.getElementById('canvas');
+    const ctx = canvasEl.getContext('2d');
+    const imageWidth = canvasEl.width, imageHeight = canvasEl.height;
+    const samplesPerPixel = 200;
+    const maxDepth = 8;
+    const progBar = document.querySelector('#progress>div');
+
+    function setProgress(percent) {
+      progBar.style.width = percent + '%';
+    }
+
+    let cancelRequested = false;
+    let rendering = false;
+
+    function rayColor(ray, depth) {
+      if (depth <= 0) return new Vec3(0, 0, 0);
+      const rec = new HitRecord();
+      if (hitWorldWrapper(ray, rec)) {
+        const scattered = new Array(1);
+        const attenuation = new Array(1);
+        if (scatterFunc(ray, rec, attenuation, scattered)) {
+          return attenuation[0].mulV(rayColor(scattered[0], depth - 1));
+        }
+        return new Vec3(0, 0, 0);
+      }
+      const unitDir = ray.d.unit();
+      const t = 0.5 * (unitDir.y + 1.0);
+      return new Vec3(1, 1, 1).mul(1 - t).add(new Vec3(0.5, 0.7, 1.0).mul(t));
+    }
+
+    async function render() {
+      rendering = true;
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+      cancelRequested = false;
+      const start = timeNow();
+      const totalSamples = imageWidth * imageHeight * samplesPerPixel;
+      let pixelCount = 0;
+
+      // Quick low-resolution preview pass so users see visible output fast.
+      const previewSize = 240; // square preview for quick rendering
+      const previewSpp = parseInt(document.getElementById('previewSpp').value, 10) || 2;
+      if (!cancelRequested) {
+        const previewImageData = ctx.createImageData(previewSize, previewSize);
+        const pData = previewImageData.data;
+        for (let py = previewSize - 1; py >= 0; py--) {
+          for (let px = 0; px < previewSize; px++) {
+            if (cancelRequested) break;
+            let pColor = new Vec3(0, 0, 0);
+            for (let s = 0; s < previewSpp; s++) {
+              const u = (px + rand()) / previewSize;
+              const v = (py + rand()) / previewSize;
+              const dir = new Vec3(u - 0.5, v - 0.5, -1).unit();
+              const r = new Ray(new Vec3(0, 0, 0), dir);
+              pColor = pColor.add(rayColor(r, maxDepth));
+            }
+            const rCol = Math.sqrt(pColor.x / previewSpp);
+            const gCol = Math.sqrt(pColor.y / previewSpp);
+            const bCol = Math.sqrt(pColor.z / previewSpp);
+            const idx = (px + (previewSize - 1 - py) * previewSize) * 4;
+            pData[idx + 0] = to255(rCol);
+            pData[idx + 1] = to255(gCol);
+            pData[idx + 2] = to255(bCol);
+            pData[idx + 3] = 255;
+          }
+          // paint current preview row scaled up to canvas so it's immediately visible
+          ctx.putImageData(previewImageData, 0, imageHeight - previewSize);
+          if (cancelRequested) break;
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      // Now run the full-resolution scanline render using ImageData per scanline.
+      // Create a single-row ImageData buffer and reuse it for each scanline.
+      if (!cancelRequested) {
+        const rowImageData = ctx.createImageData(imageWidth, 1);
+        const rowData = rowImageData.data; // Uint8ClampedArray length = imageWidth * 4
+        for (let j = imageHeight - 1; j >= 0; j--) {
+          // Fill this scanline's pixels into the rowData buffer
+          for (let i = 0; i < imageWidth; i++) {
+            if (cancelRequested) break;
+            let pixelColor = new Vec3(0, 0, 0);
+            for (let s = 0; s < samplesPerPixel; s++) {
+              const u = (i + rand()) / imageWidth;
+              const v = (j + rand()) / imageHeight;
+              const dir = new Vec3(u - 0.5, v - 0.5, -1).unit();
+              const r = new Ray(new Vec3(0, 0, 0), dir);
+              pixelColor = pixelColor.add(rayColor(r, maxDepth));
+            }
+
+            // Convert accumulated color to 0..255 with gamma correction
+            const rCol = Math.sqrt(pixelColor.x / samplesPerPixel);
+            const gCol = Math.sqrt(pixelColor.y / samplesPerPixel);
+            const bCol = Math.sqrt(pixelColor.z / samplesPerPixel);
+            const idx = i * 4;
+            rowData[idx + 0] = to255(rCol);
+            rowData[idx + 1] = to255(gCol);
+            rowData[idx + 2] = to255(bCol);
+            rowData[idx + 3] = 255; // alpha
+
+            pixelCount++;
+          }
+
+          // Paint the completed scanline to the canvas
+          ctx.putImageData(rowImageData, 0, j);
+          setProgress(100 * pixelCount / (imageWidth * imageHeight));
+          if (cancelRequested) break;
+
+          // yield to UI so the browser can repaint and remain responsive
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      const duration = (timeNow() - start) / 1000;
+      document.getElementById('results').textContent =
+        `Rendered ${imageWidth}x${imageHeight} (${samplesPerPixel} spp) in ${duration.toFixed(2)}s\n` +
+        `≈ ${(totalSamples / duration).toFixed(0)} samples per second`;
+      rendering = false;
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+      setProgress(0);
+    }
+
+    document.getElementById('start').addEventListener('click', () => {
+      if (rendering) return;
+      ctx.clearRect(0, 0, imageWidth, imageHeight);
+      document.getElementById('results').textContent = 'Running…';
+      render();
+    });
+    document.getElementById('stop').addEventListener('click', () => {
+      cancelRequested = true;
+    });
+
+    function timeNow() {
+      return performance.now();
+    }
+  });
+  </script>
 </body>
 </html>
