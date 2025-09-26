@@ -7,15 +7,20 @@
   body {font-family: monospace; margin: 2rem; background:#222;color:#eee;}
   #canvas{border:1px solid #555;background:#111;}
   #controls{margin-top:1rem;}
-  button{padding:.5rem 1rem;font-size:1rem;margin-right:.5rem;}
+  button, select{padding:.5rem 1rem;font-size:1rem;margin-right:.5rem;}
   #results{margin-top:1rem;white-space:pre-wrap;}
 </style>
 </head>
 <body>
 <h1>CPU‑Only Path Tracer Benchmark</h1>
-<canvas id="canvas" width="1200" height="1200"></canvas>
+<canvas id="canvas" width="800" height="800"></canvas>
 
 <div id="controls">
+  <select id="complexity">
+    <option value="light">Light</option>
+    <option value="medium">Medium</option>
+    <option value="heavy">Heavy</option>
+  </select>
   <button id="start">Start Benchmark</button>
   <button id="stop" disabled>Stop (while rendering)</button>
 </div>
@@ -24,7 +29,7 @@
 
 <script>
 // ------------------------------------------------------------
-// Simple Vector3 helper
+// Vec3 and Helpers
 class Vec3{
   constructor(x,y,z){this.x=x;this.y=y;this.z=z;}
   add(v){return new Vec3(this.x+v.x,this.y+v.y,this.z+v.z);}
@@ -61,7 +66,7 @@ function writeColor(ctx, x, y, pixelColor, samplesPerPixel){
 }
 
 // ------------------------------------------------------------
-// Ray and Hit
+// Ray, Hit, Material
 class Ray{
   constructor(origin, dir){this.o=origin;this.d=dir.unit();}
   at(t){return this.o.add(this.d.mul(t));}
@@ -73,9 +78,6 @@ class HitRecord{
     this.n = this.frontFace ? outwardNormal : outwardNormal.mul(-1);
   }
 }
-
-// ------------------------------------------------------------
-// Materials
 class Lambertian{
   constructor(albedo){this.albedo=albedo;}
   scatter(rIn, rec){
@@ -112,12 +114,54 @@ class Sphere{
 }
 
 // ------------------------------------------------------------
-// World
-const world = [];
-world.push(new Sphere(new Vec3(0,-100.5,-1), 100, new Lambertian(new Vec3(0.8,0.8,0.0))));
-world.push(new Sphere(new Vec3(0,0,-1), 0.5, new Lambertian(new Vec3(0.7,0.3,0.3))));
-world.push(new Sphere(new Vec3(-1,0,-1), 0.5, new Lambertian(new Vec3(0.8,0.8,0.8))));
-world.push(new Sphere(new Vec3(1,0,-1), 0.5, new Lambertian(new Vec3(0.8,0.6,0.2))));
+// Scene and Camera
+let world = [];
+let origin, lowerLeftCorner, horizontal, vertical;
+
+function setupCamera(sceneSize){
+  const aspectRatio = 1;
+  const viewportHeight = 2;
+  const viewportWidth = aspectRatio * viewportHeight;
+  const focalLength = 1;
+
+  // Move camera back based on scene size
+  origin = new Vec3(0, sceneSize > 10 ? 2 : 0, sceneSize + 1.5);
+  horizontal = new Vec3(viewportWidth * sceneSize, 0, 0);
+  vertical = new Vec3(0, viewportHeight * sceneSize, 0);
+  lowerLeftCorner = origin
+    .sub(horizontal.div(2))
+    .sub(vertical.div(2))
+    .sub(new Vec3(0, 0, focalLength * sceneSize));
+}
+
+function buildScene(level){
+  world = [];
+  const groundMat = new Lambertian(new Vec3(0.5, 0.5, 0.5));
+  world.push(new Sphere(new Vec3(0,-1000,0), 1000, groundMat));
+
+  // Static main spheres
+  world.push(new Sphere(new Vec3(0,1,0), 1, new Lambertian(new Vec3(0.7,0.3,0.3))));
+  world.push(new Sphere(new Vec3(-2,1,0), 1, new Lambertian(new Vec3(0.8,0.8,0.8))));
+  world.push(new Sphere(new Vec3(2,1,0), 1, new Lambertian(new Vec3(0.8,0.6,0.2))));
+
+  let count = 0;
+  if(level === "light") count = 10;
+  if(level === "medium") count = 100;
+  if(level === "heavy") count = 500;
+
+  for(let a = -11; a < 11 && count > 0; a++){
+    for(let b = -11; b < 11 && count > 0; b++){
+      const center = new Vec3(a + 0.9*rand(), 0.2, b + 0.9*rand());
+      if(center.sub(new Vec3(4,0.2,0)).length() > 0.9){
+        const albedo = new Vec3(rand()*rand(), rand()*rand(), rand()*rand());
+        world.push(new Sphere(center, 0.2, new Lambertian(albedo)));
+        count--;
+      }
+    }
+  }
+
+  setupCamera(level === "light" ? 3 : level === "medium" ? 8 : 14);
+}
 
 function hitWorld(r, tMin, tMax, rec){
   let tempRec = new HitRecord();
@@ -127,56 +171,37 @@ function hitWorld(r, tMin, tMax, rec){
     if(obj.hit(r, tMin, closestSoFar, tempRec)){
       hitAnything=true;
       closestSoFar = tempRec.t;
-      rec.t = tempRec.t;
-      rec.p = tempRec.p;
-      rec.n = tempRec.n;
-      rec.frontFace = tempRec.frontFace;
-      rec.mat = tempRec.mat;
+      Object.assign(rec, tempRec);
     }
   }
   return hitAnything;
 }
 
 // ------------------------------------------------------------
-// Camera
-const aspectRatio = 1;
-const viewportHeight = 2;
-const viewportWidth = aspectRatio*viewportHeight;
-const focalLength = 1;
-const origin = new Vec3(0,0,0);
-const horizontal = new Vec3(viewportWidth,0,0);
-const vertical = new Vec3(0,viewportHeight,0);
-const lowerLeftCorner = origin
-  .sub(horizontal.div(2))
-  .sub(vertical.div(2))
-  .sub(new Vec3(0,0,focalLength));
-
-// ------------------------------------------------------------
-// Ray color (recursive)
+// Ray color
 function rayColor(r, depth){
   if(depth<=0) return new Vec3(0,0,0);
   const rec = new HitRecord();
   if(hitWorld(r, 0.001, Infinity, rec)){
     const scatter = rec.mat.scatter(r, rec);
     if(scatter){
-      const att = scatter.attenuation;
       const col = rayColor(scatter.scattered, depth-1);
-      return att.mulV(col);
+      return scatter.attenuation.mulV(col);
     }
     return new Vec3(0,0,0);
   }
   const unitDir = r.d.unit();
   const t = 0.5*(unitDir.y+1.0);
-  return new Vec3(1.0,1.0,1.0).mul(1.0-t).add(new Vec3(0.5,0.7,1.0).mul(t));
+  return new Vec3(1,1,1).mul(1.0-t).add(new Vec3(0.5,0.7,1.0).mul(t));
 }
 
 // ------------------------------------------------------------
-// Rendering / Benchmark
+// Rendering
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const imageWidth = canvas.width;
 const imageHeight = canvas.height;
-const samplesPerPixel = 50; // tweak to change benchmark load
+const samplesPerPixel = 20;
 const maxDepth = 5;
 let rendering = false;
 let cancelRequested = false;
@@ -201,35 +226,38 @@ function renderPixel(x,y){
 async function render(){
   rendering = true;
   cancelRequested = false;
+  document.getElementById('stop').disabled = false;
   const start = performance.now();
   for(let j=imageHeight-1; j>=0 && !cancelRequested; --j){
     for(let i=0; i<imageWidth && !cancelRequested; ++i){
       renderPixel(i,j);
     }
-    if(j % 20 === 0){ // allow UI updates every 20 rows
-      await new Promise(r=>requestAnimationFrame(r));
-    }
+    if(j % 20 === 0){ await new Promise(r=>requestAnimationFrame(r)); }
   }
-  const end = performance.now();
   rendering = false;
+  document.getElementById('stop').disabled = true;
+  const end = performance.now();
   const duration = (end-start)/1000;
   const totalSamples = imageWidth*imageHeight*samplesPerPixel;
   document.getElementById('results').textContent =
     `Rendered ${imageWidth}x${imageHeight} (${samplesPerPixel} spp) in ${duration.toFixed(2)}s\n`+
-    `≈ ${ (totalSamples/duration).toFixed(0)} samples per second`;
+    `≈ ${ (totalSamples/duration).toFixed(0)} samples/sec`;
 }
 
 // ------------------------------------------------------------
 document.getElementById('start').addEventListener('click', ()=>{
   if(rendering) return;
+  const level = document.getElementById('complexity').value;
+  buildScene(level);
   ctx.clearRect(0,0,imageWidth,imageHeight);
   document.getElementById('results').textContent = 'Running...';
   render();
 });
+
 document.getElementById('stop').addEventListener('click', ()=>{
   cancelRequested = true;
 });
-
 </script>
 </body>
 </html>
+
